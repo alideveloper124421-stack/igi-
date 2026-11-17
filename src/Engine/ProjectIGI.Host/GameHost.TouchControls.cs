@@ -48,6 +48,9 @@ public sealed partial class GameHost
     // between frames so the pull does not flicker between guards, and re-validated
     // every frame, so a dead or departed guard drops out on its own.
     private int _aimLockTargetId = -1;
+    // The touch aim assist's own frame clock, in milliseconds (-1 until it has run): the pad keeps its own,
+    // and the two never run in the same frame.
+    private int _lastTouchAssistMs = -1;
     // The virtual pointer the left stick drives over the retail menu, the shell
     // and the map computer: kept between frames so the cursor stays where the
     // stick left it. It only moves while the stick is deflected, so a touch tap
@@ -193,6 +196,10 @@ public sealed partial class GameHost
         _touchKeysWanted.Clear();
         _touchButtonsWanted.Clear();
         PlayerProfile? profile = _configuration.Active;
+        // The mouse counts the fingers and the gyroscope turn the view by this frame: what the touch aim assist
+        // reads as the player's own hand.
+        float touchLookCountsX = 0f;
+        float touchLookCountsY = 0f;
 
         if (mode == TouchControlMode.Computer && !padActive)
         {
@@ -271,6 +278,8 @@ public sealed partial class GameHost
             if (_touchControls.Look is { } look && (look.X != 0f || look.Y != 0f))
             {
                 input.Mouse.AddMotion(look.X, look.Y);
+                touchLookCountsX += look.X;
+                touchLookCountsY += look.Y;
             }
 
         }
@@ -315,6 +324,23 @@ public sealed partial class GameHost
                 }
 
                 input.Mouse.AddMotion(gyroYaw * countsPerRadian, gyroPitch * countsPerRadian);
+                touchLookCountsX += gyroYaw * countsPerRadian;
+                touchLookCountsY += gyroPitch * countsPerRadian;
+            }
+        }
+
+        // The aim assist for touch and gyro look. With a pad connected the pad's own lock owns the shared target, so
+        // nothing here may touch it then.
+        if (!padActive)
+        {
+            if (mode == TouchControlMode.Play)
+            {
+                ApplyTouchAimAssist(profile, touchLookCountsX, touchLookCountsY);
+            }
+            else
+            {
+                _aimLockTargetId = -1;
+                _lastTouchAssistMs = -1;
             }
         }
 
@@ -803,6 +829,57 @@ public sealed partial class GameHost
     /// </remarks>
     private void ApplyGamepadAimAssist(GamepadState pad, PlayerProfile? profile, float elapsed)
     {
+        // The wheel steers with the right stick: the lock stays out of it.
+        if (pad.IsDown(PadControl(GamepadBindings(profile), "WeaponWheel"), GamepadTriggerThreshold))
+        {
+            _aimLockTargetId = -1;
+            return;
+        }
+
+        float stickX = DeadZoned(pad.RightStickX, GamepadStickDeadZone);
+        float stickY = DeadZoned(pad.RightStickY, GamepadStickDeadZone);
+        float stickTurnRate = GamepadMaxTurnRadiansPerSecond * GamepadLookGain(profile);
+        ApplyAimLock(profile, elapsed, stickX, stickY, stickTurnRate);
+    }
+
+    /// <summary>The aim lock for touch and gyro look: the same lock as the pad's, with the fingers' own turn standing in for the stick.</summary>
+    /// <remarks>
+    /// It is soft by design: it runs only while the player fires or looks down a sight, and the turn the player is making
+    /// is what the pull is measured against, so dragging away from the guard releases it and the hand always wins.
+    /// Strength and radius are the profile's Aim Lock settings, shared with the pad; strength zero turns it off.
+    /// </remarks>
+    private void ApplyTouchAimAssist(PlayerProfile? profile, float lookCountsX, float lookCountsY)
+    {
+        int now = _loop.TimeSource.Milliseconds;
+        float elapsed = _lastTouchAssistMs < 0
+            ? 0f
+            : Math.Clamp((now - _lastTouchAssistMs) / 1000f, 0f, 0.1f);
+        _lastTouchAssistMs = now;
+
+        bool wanted = _touchControls.Held.Contains(TouchButton.Fire)
+            || _touchControls.Held.Contains(TouchButton.Scope)
+            || OpticsZoomed();
+        if (!wanted || elapsed <= 0f)
+        {
+            _aimLockTargetId = -1;
+            return;
+        }
+
+        // The counts the view will turn by, as radians a second: the same units the pad's stick turn rate is in,
+        // so the lock's share and release rules read the finger exactly as they read the stick.
+        float radiansPerCount = MouseLookSettings.FromProfile(profile).RadiansPerCount;
+        float radiansPerSecondPerCount = radiansPerCount / elapsed;
+        ApplyAimLock(profile, elapsed, lookCountsX * radiansPerSecondPerCount, lookCountsY * radiansPerSecondPerCount, 1f);
+    }
+
+    /// <summary>The shared lock: pulls the view toward the guard near the crosshair, measured against the turn the player's own hand is making.</summary>
+    /// <param name="profile">The active profile, for the lock's strength and radius.</param>
+    /// <param name="elapsed">Seconds since the last frame.</param>
+    /// <param name="stickX">The player's yaw input: a stick's deflection, or a turn rate when <paramref name="stickTurnRate"/> is one.</param>
+    /// <param name="stickY">The player's pitch input, signed like the mouse's (down is positive).</param>
+    /// <param name="stickTurnRate">The turn rate at full input, in radians a second.</param>
+    private void ApplyAimLock(PlayerProfile? profile, float elapsed, float stickX, float stickY, float stickTurnRate)
+    {
         float strength = profile?.AimLockStrength ?? PlayerProfile.DefaultAimLockStrength;
         float radius = profile?.AimLockRadius ?? PlayerProfile.DefaultAimLockRadius;
         if (elapsed <= 0f || strength <= 0f || radius <= 0f || _soldiers is null || HostedPlayer is not { } hosted)
@@ -814,8 +891,7 @@ public sealed partial class GameHost
         // The wheel steers with the right stick, the binoculars scan rather than aim, and a mounted gun, a ladder or an
         // interaction turns the view by its own rules: the lock stays out of all of them. Menus and the map computer
         // never reach here — only Play calls the look — and touch and mouse look never pass through this method at all.
-        if (pad.IsDown(PadControl(GamepadBindings(profile), "WeaponWheel"), GamepadTriggerThreshold)
-            || hosted.IsBinocularsOpen || hosted.IsMountedStationaryGun
+        if (hosted.IsBinocularsOpen || hosted.IsMountedStationaryGun
             || hosted.IsOnLadder || hosted.IsInWorldInteraction)
         {
             _aimLockTargetId = -1;
@@ -964,10 +1040,6 @@ public sealed partial class GameHost
         // The stick's own deflection, dead-zoned as the look reads it, and the turn rate the stick
         // itself is turning at — the sensitivity gain scales it, so the share clamp below compares
         // the pull against what the player's hand is actually doing.
-        float stickX = DeadZoned(pad.RightStickX, GamepadStickDeadZone);
-        float stickY = DeadZoned(pad.RightStickY, GamepadStickDeadZone);
-        float stickTurnRate = GamepadMaxTurnRadiansPerSecond * GamepadLookGain(profile);
-
         // The settings the view will apply to the counts: the profile's mouse sensitivity, as the
         // look's conversion uses — converting through the controller's own rate would divide the
         // two and let the sensitivity slider lean the lock backwards. The invert is the same one
