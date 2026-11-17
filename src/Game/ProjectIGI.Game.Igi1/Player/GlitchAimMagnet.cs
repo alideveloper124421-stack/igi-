@@ -8,7 +8,7 @@ namespace ProjectIGI.Game.Igi1.Player;
 
 public static class GlitchAimMagnet
 {
-    public static bool Enabled = true;
+    public static bool Enabled = false;
     public static float ActivateFovDeg = 15f;
     public static float LockBreakDeg = 35f;
     public static float SnapFactor = 0.55f;

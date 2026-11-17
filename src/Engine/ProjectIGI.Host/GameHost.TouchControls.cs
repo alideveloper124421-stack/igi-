@@ -104,6 +104,7 @@ public sealed partial class GameHost
 
     /// <summary>The team the binoculars mark hostile red: the guards. Anything else is the player's own side.</summary>
     private const int GamepadAimAssistEnemyTeam = 1;
+    private static readonly double AimLockHeadOffsetUnits = 0.30 * WorldScene.UnitsPerMetre;
 
     /// <summary>How fast the virtual pointer crosses the screen, in pixels a second.</summary>
     private const float GamepadPointerSpeedPixelsPerSecond = 900f;
@@ -873,7 +874,7 @@ public sealed partial class GameHost
             // The view's own yaw/pitch for this direction: LookRotation's forward is
             // (sin yaw · cos pitch, cos yaw · cos pitch, sin pitch), so the inverse is atan2 and asin.
             double desiredYaw = Math.Atan2(delta.X, delta.Y);
-            double desiredPitch = Math.Asin(Math.Clamp(delta.Z / distance, -1.0, 1.0));
+            double desiredPitch = Math.Atan2(delta.Z + AimLockHeadOffsetUnits, Math.Sqrt((delta.X * delta.X) + (delta.Y * delta.Y)));
             double yawError = WrapAngle(desiredYaw - yaw);
             double pitchError = desiredPitch - pitch;
             double angle = Math.Sqrt((yawError * yawError) + (pitchError * pitchError));
