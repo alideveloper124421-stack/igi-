@@ -121,6 +121,12 @@ public sealed partial class GameHost
     /// <summary>A turn of the player's own hand faster than this, away from the guard, breaks the head lock for that frame: radians a second.</summary>
     private const float HeadLockBreakRadiansPerSecond = 1.2f;
 
+    /// <summary>How far away a guard may be and still draw the head lock, in metres: far past any sight line in a level.</summary>
+    private const float HeadLockRangeMetres = 500f;
+
+    /// <summary>The narrowest cone the head lock looks in, in radians (about thirty-four degrees), however far a sight is zoomed.</summary>
+    private const float HeadLockMinConeRadians = 0.6f;
+
     /// <summary>How fast the virtual pointer crosses the screen, in pixels a second.</summary>
     private const float GamepadPointerSpeedPixelsPerSecond = 900f;
 
@@ -856,8 +862,8 @@ public sealed partial class GameHost
 
     /// <summary>The aim lock for touch and gyro look: the same lock as the pad's, with the fingers' own turn standing in for the stick.</summary>
     /// <remarks>
-    /// It is soft by design: it runs only while the player fires or looks down a sight, and the turn the player is making
-    /// is what the pull is measured against, so dragging away from the guard releases it and the hand always wins.
+    /// From <see cref="HeadLockMinStrength"/> up it is a head lock that runs on its own with every gun; below it, a soft pull
+    /// that runs only while the player fires or looks down a sight, measured against the turn the player is making.
     /// Strength and radius are the profile's Aim Lock settings, shared with the pad; strength zero turns it off.
     /// </remarks>
     private void ApplyTouchAimAssist(PlayerProfile? profile, float lookCountsX, float lookCountsY)
@@ -868,7 +874,13 @@ public sealed partial class GameHost
             : Math.Clamp((now - _lastTouchAssistMs) / 1000f, 0f, 0.1f);
         _lastTouchAssistMs = now;
 
-        bool wanted = _touchControls.Held.Contains(TouchButton.Fire)
+        float strength = profile?.AimLockStrength ?? PlayerProfile.DefaultAimLockStrength;
+        bool hardLock = strength >= HeadLockMinStrength;
+
+        // The head lock needs no button and no scope: it works with every gun, as the guard comes near the crosshair.
+        // The soft pull below its strength runs only while the player fires or looks down a sight.
+        bool wanted = hardLock
+            || _touchControls.Held.Contains(TouchButton.Fire)
             || _touchControls.Held.Contains(TouchButton.Scope)
             || OpticsZoomed();
         if (!wanted || elapsed <= 0f)
@@ -881,14 +893,13 @@ public sealed partial class GameHost
         // so the lock's share and release rules read the finger exactly as they read the stick.
         float radiansPerCount = MouseLookSettings.FromProfile(profile).RadiansPerCount;
         float radiansPerSecondPerCount = radiansPerCount / elapsed;
-        float strength = profile?.AimLockStrength ?? PlayerProfile.DefaultAimLockStrength;
         ApplyAimLock(
             profile,
             elapsed,
             lookCountsX * radiansPerSecondPerCount,
             lookCountsY * radiansPerSecondPerCount,
             1f,
-            hardLock: strength >= HeadLockMinStrength);
+            hardLock);
     }
 
     /// <summary>The shared lock: pulls the view toward the guard near the crosshair, measured against the turn the player's own hand is making.</summary>
@@ -937,6 +948,11 @@ public sealed partial class GameHost
             ? MathF.Tan(fixedFov * (MathF.PI / 360f))
             : sight.TanX * baseTangent;
         double cone = radius * Math.Atan(horizontalTangent);
+        if (hardLock)
+        {
+            // A sight narrows the lens, and the cone with it: the head lock keeps its reach however far it is zoomed.
+            cone = Math.Max(cone, HeadLockMinConeRadians);
+        }
         if (cone <= 0.0)
         {
             _aimLockTargetId = -1;
@@ -946,7 +962,7 @@ public sealed partial class GameHost
         Vector3d eye = hosted.EyeUnits;
         float yaw = hosted.Body.Yaw;
         float pitch = hosted.Body.Pitch;
-        double rangeUnits = GamepadAimAssistRangeMetres * WorldScene.UnitsPerMetre;
+        double rangeUnits = (hardLock ? HeadLockRangeMetres : GamepadAimAssistRangeMetres) * WorldScene.UnitsPerMetre;
         double stickyCone = cone * GamepadAimAssistStickyConeFactor;
 
         // Every guard near the cone, nearest first: the aim point is the soldier's origin, about chest height, which is
