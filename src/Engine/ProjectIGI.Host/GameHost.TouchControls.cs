@@ -107,7 +107,19 @@ public sealed partial class GameHost
 
     /// <summary>The team the binoculars mark hostile red: the guards. Anything else is the player's own side.</summary>
     private const int GamepadAimAssistEnemyTeam = 1;
-    private static readonly double AimLockHeadOffsetUnits = 0.30 * WorldScene.UnitsPerMetre;
+    private static readonly double AimLockHeadOffsetUnits = 0.38 * WorldScene.UnitsPerMetre;
+
+    /// <summary>The aim lock strength from which touch and gyro look hard-lock onto the head instead of leaning; below it the pull stays soft.</summary>
+    private const float HeadLockMinStrength = 0.5f;
+
+    /// <summary>How fast the head lock closes on its target at zero strength, as a rate of the remaining angle: it is exponential, so the view arrives without overshoot.</summary>
+    private const float HeadLockMinSpeedPerSecond = 20f;
+
+    /// <summary>How fast the head lock closes on its target at full strength.</summary>
+    private const float HeadLockMaxSpeedPerSecond = 60f;
+
+    /// <summary>A turn of the player's own hand faster than this, away from the guard, breaks the head lock for that frame: radians a second.</summary>
+    private const float HeadLockBreakRadiansPerSecond = 1.2f;
 
     /// <summary>How fast the virtual pointer crosses the screen, in pixels a second.</summary>
     private const float GamepadPointerSpeedPixelsPerSecond = 900f;
@@ -839,7 +851,7 @@ public sealed partial class GameHost
         float stickX = DeadZoned(pad.RightStickX, GamepadStickDeadZone);
         float stickY = DeadZoned(pad.RightStickY, GamepadStickDeadZone);
         float stickTurnRate = GamepadMaxTurnRadiansPerSecond * GamepadLookGain(profile);
-        ApplyAimLock(profile, elapsed, stickX, stickY, stickTurnRate);
+        ApplyAimLock(profile, elapsed, stickX, stickY, stickTurnRate, hardLock: false);
     }
 
     /// <summary>The aim lock for touch and gyro look: the same lock as the pad's, with the fingers' own turn standing in for the stick.</summary>
@@ -869,7 +881,14 @@ public sealed partial class GameHost
         // so the lock's share and release rules read the finger exactly as they read the stick.
         float radiansPerCount = MouseLookSettings.FromProfile(profile).RadiansPerCount;
         float radiansPerSecondPerCount = radiansPerCount / elapsed;
-        ApplyAimLock(profile, elapsed, lookCountsX * radiansPerSecondPerCount, lookCountsY * radiansPerSecondPerCount, 1f);
+        float strength = profile?.AimLockStrength ?? PlayerProfile.DefaultAimLockStrength;
+        ApplyAimLock(
+            profile,
+            elapsed,
+            lookCountsX * radiansPerSecondPerCount,
+            lookCountsY * radiansPerSecondPerCount,
+            1f,
+            hardLock: strength >= HeadLockMinStrength);
     }
 
     /// <summary>The shared lock: pulls the view toward the guard near the crosshair, measured against the turn the player's own hand is making.</summary>
@@ -878,7 +897,8 @@ public sealed partial class GameHost
     /// <param name="stickX">The player's yaw input: a stick's deflection, or a turn rate when <paramref name="stickTurnRate"/> is one.</param>
     /// <param name="stickY">The player's pitch input, signed like the mouse's (down is positive).</param>
     /// <param name="stickTurnRate">The turn rate at full input, in radians a second.</param>
-    private void ApplyAimLock(PlayerProfile? profile, float elapsed, float stickX, float stickY, float stickTurnRate)
+    /// <param name="hardLock">Whether to lock the view onto the guard's head outright, rather than lean toward it.</param>
+    private void ApplyAimLock(PlayerProfile? profile, float elapsed, float stickX, float stickY, float stickTurnRate, bool hardLock)
     {
         float strength = profile?.AimLockStrength ?? PlayerProfile.DefaultAimLockStrength;
         float radius = profile?.AimLockRadius ?? PlayerProfile.DefaultAimLockRadius;
@@ -1045,6 +1065,31 @@ public sealed partial class GameHost
         // two and let the sensitivity slider lean the lock backwards. The invert is the same one
         // either way; it is the profile's.
         MouseLookSettings look = MouseLookSettings.FromProfile(profile);
+
+        if (hardLock)
+        {
+            // Head lock: the body's own yaw and pitch are steered straight at the head, so the sight's slowed look
+            // scaling and the invert setting have nothing to dilute. A quick flick of the hand away from the guard
+            // breaks it for that frame, so the player can still turn away.
+            float handYawRate = stickX * stickTurnRate;
+            float handPitchRate = (look.InvertPitch ? stickY : -stickY) * stickTurnRate;
+            bool flickedAway =
+                (handYawRate * target.YawError < 0.0 && MathF.Abs(handYawRate) > HeadLockBreakRadiansPerSecond)
+                || (handPitchRate * target.PitchError < 0.0 && MathF.Abs(handPitchRate) > HeadLockBreakRadiansPerSecond);
+            if (!flickedAway)
+            {
+                float speed = HeadLockMinSpeedPerSecond
+                    + ((HeadLockMaxSpeedPerSecond - HeadLockMinSpeedPerSecond) * strength);
+                float blend = 1f - MathF.Exp(-speed * elapsed);
+                hosted.Body.Yaw += (float)(target.YawError * blend);
+                hosted.Body.Pitch = Math.Clamp(
+                    hosted.Body.Pitch + (float)(target.PitchError * blend),
+                    -PlayerBody.PitchLimit,
+                    PlayerBody.PitchLimit);
+            }
+
+            return;
+        }
 
         if (stickX == 0f && stickY == 0f)
         {
